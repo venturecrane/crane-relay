@@ -1,8 +1,11 @@
 /**
- * DFG Relay Worker
- * 
+ * Crane Relay Worker
+ *
  * Enables PM Team to create GitHub issues via HTTP POST.
  * Eliminates copy-paste handoffs between Claude Web and GitHub.
+ *
+ * Multi-repo support: All endpoints accept an optional `repo` parameter.
+ * If not provided, defaults to GITHUB_OWNER/GITHUB_REPO from env.
  */
 
 interface Env {
@@ -29,22 +32,26 @@ interface DirectivePayload {
   labels: string[];
   body: string;
   assignees?: string[];
+  repo?: string; // Optional: defaults to GITHUB_OWNER/GITHUB_REPO
 }
 
 interface CommentPayload {
   issue: number;
   body: string;
+  repo?: string; // Optional: defaults to GITHUB_OWNER/GITHUB_REPO
 }
 
 interface ClosePayload {
   issue: number;
   comment?: string;
+  repo?: string; // Optional: defaults to GITHUB_OWNER/GITHUB_REPO
 }
 
 interface LabelsPayload {
   issue: number;
   add?: string[];
   remove?: string[];
+  repo?: string; // Optional: defaults to GITHUB_OWNER/GITHUB_REPO
 }
 
 interface GitHubIssueResponse {
@@ -140,6 +147,16 @@ async function sha256Hex(input: string): Promise<string> {
   const hash = await crypto.subtle.digest("SHA-256", enc);
   const bytes = new Uint8Array(hash);
   return Array.from(bytes).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Get default repo from env or use provided repo
+ */
+function getRepo(env: Env, providedRepo?: string): string {
+  if (providedRepo && isRepoSlug(providedRepo)) {
+    return providedRepo;
+  }
+  return `${env.GITHUB_OWNER}/${env.GITHUB_REPO}`;
 }
 
 // CORS configuration (#98)
@@ -274,12 +291,15 @@ async function handleDirective(request: Request, env: Env): Promise<Response> {
     }, 400);
   }
 
+  // Get repo (with default)
+  const repo = getRepo(env, payload.repo);
+
   // Build issue body with metadata header
   const issueBody = buildIssueBody(payload);
 
   // Create GitHub issue
   try {
-    const issue = await createGitHubIssue(env, {
+    const issue = await createGitHubIssue(env, repo, {
       title: payload.title,
       body: issueBody,
       labels: payload.labels || [],
@@ -290,6 +310,7 @@ async function handleDirective(request: Request, env: Env): Promise<Response> {
       success: true,
       issue: issue.number,
       url: issue.html_url,
+      repo,
     });
   } catch (error) {
     console.error('GitHub API error:', error);
@@ -305,7 +326,7 @@ async function handleDirective(request: Request, env: Env): Promise<Response> {
  */
 function buildIssueBody(payload: DirectivePayload): string {
   const header = [
-    '<!-- DFG Relay: Auto-generated issue -->',
+    '<!-- Crane Relay: Auto-generated issue -->',
     `**Routed to:** ${payload.to.toUpperCase()} Team`,
     `**Created:** ${new Date().toISOString()}`,
     '',
@@ -403,13 +424,17 @@ async function handleComment(request: Request, env: Env): Promise<Response> {
     }, 400);
   }
 
+  // Get repo (with default)
+  const repo = getRepo(env, payload.repo);
+
   // Create GitHub comment
   try {
-    await createGitHubComment(env, payload.issue, payload.body);
+    await createGitHubComment(env, repo, payload.issue, payload.body);
 
     return jsonResponse({
       success: true,
       issue: payload.issue,
+      repo,
     });
   } catch (error) {
     console.error('GitHub API error:', error);
@@ -451,19 +476,23 @@ async function handleClose(request: Request, env: Env): Promise<Response> {
     }, 400);
   }
 
+  // Get repo (with default)
+  const repo = getRepo(env, payload.repo);
+
   // Close GitHub issue (with optional comment)
   try {
     // Add comment if provided
     if (payload.comment) {
-      await createGitHubComment(env, payload.issue, payload.comment);
+      await createGitHubComment(env, repo, payload.issue, payload.comment);
     }
 
     // Close the issue
-    await closeGitHubIssue(env, payload.issue);
+    await closeGitHubIssue(env, repo, payload.issue);
 
     return jsonResponse({
       success: true,
       issue: payload.issue,
+      repo,
     });
   } catch (error) {
     console.error('GitHub API error:', error);
@@ -513,26 +542,30 @@ async function handleLabels(request: Request, env: Env): Promise<Response> {
     }, 400);
   }
 
+  // Get repo (with default)
+  const repo = getRepo(env, payload.repo);
+
   // Update labels on GitHub issue
   try {
     // Remove labels first (if specified)
     if (payload.remove && payload.remove.length > 0) {
       for (const label of payload.remove) {
-        await removeGitHubLabel(env, payload.issue, label);
+        await removeGitHubLabel(env, repo, payload.issue, label);
       }
     }
 
     // Add labels (if specified)
     if (payload.add && payload.add.length > 0) {
-      await addGitHubLabels(env, payload.issue, payload.add);
+      await addGitHubLabels(env, repo, payload.issue, payload.add);
     }
 
     // Fetch updated labels
-    const labels = await getGitHubLabels(env, payload.issue);
+    const labels = await getGitHubLabels(env, repo, payload.issue);
 
     return jsonResponse({
       success: true,
       issue: payload.issue,
+      repo,
       labels,
     });
   } catch (error) {
@@ -549,6 +582,7 @@ async function handleLabels(request: Request, env: Env): Promise<Response> {
  */
 async function createGitHubIssue(
   env: Env,
+  repo: string,
   params: {
     title: string;
     body: string;
@@ -556,14 +590,14 @@ async function createGitHubIssue(
     assignees: string[];
   }
 ): Promise<GitHubIssueResponse> {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/issues`;
+  const url = `https://api.github.com/repos/${repo}/issues`;
 
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': `token ${env.GITHUB_TOKEN}`,
       'Content-Type': 'application/json',
-      'User-Agent': 'dfg-relay-worker',
+      'User-Agent': 'crane-relay-worker',
       'Accept': 'application/vnd.github.v3+json',
     },
     body: JSON.stringify({
@@ -587,17 +621,18 @@ async function createGitHubIssue(
  */
 async function createGitHubComment(
   env: Env,
+  repo: string,
   issueNumber: number,
   body: string
 ): Promise<void> {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/issues/${issueNumber}/comments`;
+  const url = `https://api.github.com/repos/${repo}/issues/${issueNumber}/comments`;
 
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': `token ${env.GITHUB_TOKEN}`,
       'Content-Type': 'application/json',
-      'User-Agent': 'dfg-relay-worker',
+      'User-Agent': 'crane-relay-worker',
       'Accept': 'application/vnd.github.v3+json',
     },
     body: JSON.stringify({ body }),
@@ -614,16 +649,17 @@ async function createGitHubComment(
  */
 async function closeGitHubIssue(
   env: Env,
+  repo: string,
   issueNumber: number
 ): Promise<void> {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/issues/${issueNumber}`;
+  const url = `https://api.github.com/repos/${repo}/issues/${issueNumber}`;
 
   const response = await fetch(url, {
     method: 'PATCH',
     headers: {
       'Authorization': `token ${env.GITHUB_TOKEN}`,
       'Content-Type': 'application/json',
-      'User-Agent': 'dfg-relay-worker',
+      'User-Agent': 'crane-relay-worker',
       'Accept': 'application/vnd.github.v3+json',
     },
     body: JSON.stringify({ state: 'closed' }),
@@ -640,17 +676,18 @@ async function closeGitHubIssue(
  */
 async function addGitHubLabels(
   env: Env,
+  repo: string,
   issueNumber: number,
   labels: string[]
 ): Promise<void> {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/issues/${issueNumber}/labels`;
+  const url = `https://api.github.com/repos/${repo}/issues/${issueNumber}/labels`;
 
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       'Authorization': `token ${env.GITHUB_TOKEN}`,
       'Content-Type': 'application/json',
-      'User-Agent': 'dfg-relay-worker',
+      'User-Agent': 'crane-relay-worker',
       'Accept': 'application/vnd.github.v3+json',
     },
     body: JSON.stringify({ labels }),
@@ -667,16 +704,17 @@ async function addGitHubLabels(
  */
 async function removeGitHubLabel(
   env: Env,
+  repo: string,
   issueNumber: number,
   label: string
 ): Promise<void> {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`;
+  const url = `https://api.github.com/repos/${repo}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`;
 
   const response = await fetch(url, {
     method: 'DELETE',
     headers: {
       'Authorization': `token ${env.GITHUB_TOKEN}`,
-      'User-Agent': 'dfg-relay-worker',
+      'User-Agent': 'crane-relay-worker',
       'Accept': 'application/vnd.github.v3+json',
     },
   });
@@ -692,15 +730,16 @@ async function removeGitHubLabel(
  */
 async function getGitHubLabels(
   env: Env,
+  repo: string,
   issueNumber: number
 ): Promise<string[]> {
-  const url = `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/issues/${issueNumber}`;
+  const url = `https://api.github.com/repos/${repo}/issues/${issueNumber}`;
 
   const response = await fetch(url, {
     method: 'GET',
     headers: {
       'Authorization': `token ${env.GITHUB_TOKEN}`,
-      'User-Agent': 'dfg-relay-worker',
+      'User-Agent': 'crane-relay-worker',
       'Accept': 'application/vnd.github.v3+json',
     },
   });
@@ -896,7 +935,7 @@ async function githubFetch(env: Env, token: string, method: string, path: string
     headers: {
       "authorization": `Bearer ${token}`,
       "accept": "application/vnd.github+json",
-      "user-agent": "dfg-relay-v2",
+      "user-agent": "crane-relay-v2",
       ...(body ? { "content-type": "application/json" } : {})
     },
     body: body ? JSON.stringify(body) : undefined
@@ -1412,54 +1451,6 @@ async function handlePostEvents(req: Request, env: Env, getGhToken: () => Promis
 }
 
 // ============================================================================
-// ROUTER INTEGRATION
-// ============================================================================
-// Add these routes to your existing fetch handler:
-//
-// export default {
-//   async fetch(req: Request, env: Env): Promise<Response> {
-//     const url = new URL(req.url);
-//
-//     // Request-lifecycle cache for GitHub token
-//     let ghTokenPromise: Promise<string> | null = null;
-//     const getGhToken = () => {
-//       if (!ghTokenPromise) ghTokenPromise = getInstallationToken(env);
-//       return ghTokenPromise;
-//     };
-//
-//     // V2 ROUTES (add before existing routes)
-//     if (req.method === "POST" && url.pathname === "/v2/events") {
-//       try {
-//         return await handlePostEvents(req, env, getGhToken);
-//       } catch (err: any) {
-//         return json({ error: "Internal error", details: String(err?.message || err) }, 500);
-//       }
-//     }
-//
-//     if (req.method === "POST" && url.pathname === "/v2/evidence") {
-//       try {
-//         return await handleEvidenceUpload(req, env);
-//       } catch (err: any) {
-//         return json({ error: "Internal error", details: String(err?.message || err) }, 500);
-//       }
-//     }
-//
-//     if (req.method === "GET" && url.pathname.startsWith("/v2/evidence/")) {
-//       const id = url.pathname.replace("/v2/evidence/", "").trim();
-//       if (!id) return badRequest("Missing evidence id");
-//       try {
-//         return await handleEvidenceGet(req, env, id);
-//       } catch (err: any) {
-//         return json({ error: "Internal error", details: String(err?.message || err) }, 500);
-//       }
-//     }
-//
-//     // EXISTING ROUTES (keep as-is)
-//     // ... /health, /directive, /labels, /comment, /close ...
-//   }
-// };
-
-// ============================================================================
 // EXPORTS (for integration)
 // ============================================================================
 
@@ -1474,4 +1465,3 @@ export {
   conflict,
   unauthorized
 };
-
