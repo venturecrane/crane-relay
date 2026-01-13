@@ -1,0 +1,29 @@
+name = "dfg-relay"
+main = "src/index.ts"
+compatibility_date = "2025-12-15"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+GITHUB_OWNER = "durganfieldguide"
+GITHUB_REPO = "dfg-console"
+
+# V2 vars
+GH_APP_ID = "2619905"
+GH_INSTALLATION_ID = "103277966"
+LABEL_RULES_JSON = '{"qa.result_submitted":{"PASS":{"add":["status:verified"],"remove":["status:qa","needs:qa"]},"PASS_UNVERIFIED":{"add":[],"remove":[]},"FAIL":{"add":["needs:dev"],"remove":["needs:qa"]},"FAIL_UNCONFIRMED":{"add":[],"remove":[]},"BLOCKED":{"add":["status:blocked"],"remove":["status:qa","needs:qa"]}},"dev.update":{"_":{"add":["status:qa","needs:qa"],"remove":["status:in-progress","needs:dev"]}}}'
+
+# Secrets (set via `wrangler secret put`):
+# - GITHUB_TOKEN: GitHub PAT with repo scope
+# - RELAY_TOKEN: Shared secret for auth
+# V2 secrets:
+# - GH_PRIVATE_KEY_PEM: GitHub App private key
+# - RELAY_SHARED_SECRET: Shared secret for V2 endpoints
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dfg-relay"
+database_id = "7150d46d-483d-4d30-806c-2232eae99ae4"
+
+[[r2_buckets]]
+binding = "EVIDENCE_BUCKET"
+bucket_name = "dfg-relay-evidence"
