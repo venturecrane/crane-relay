@@ -20,7 +20,7 @@ interface Env {
   EVIDENCE_BUCKET: R2Bucket;
   RELAY_SHARED_SECRET: string;
   GH_APP_ID: string;
-  GH_INSTALLATION_ID: string;
+  GH_INSTALLATIONS_JSON: string;
   GH_PRIVATE_KEY_PEM: string;
   LABEL_RULES_JSON: string;
   GH_API_BASE?: string;
@@ -184,11 +184,14 @@ export default {
     const url = new URL(request.url);
     currentRequest = request;
 
-    // Request-lifecycle cache for GitHub token (V2)
-    let ghTokenPromise: Promise<string> | null = null;
-    const getGhToken = () => {
-      if (!ghTokenPromise) ghTokenPromise = getInstallationToken(env);
-      return ghTokenPromise;
+    // Request-lifecycle cache for GitHub tokens (V2) - keyed by org
+    const ghTokenCache: Record<string, Promise<string>> = {};
+    const getGhToken = (repo: string) => {
+      const org = repo.split("/")[0];
+      if (!ghTokenCache[org]) {
+        ghTokenCache[org] = getInstallationToken(env, repo);
+      }
+      return ghTokenCache[org];
     };
 
     // CORS headers for preflight (#98: restricted origins)
@@ -961,9 +964,16 @@ async function githubFetch(env: Env, token: string, method: string, path: string
   return res;
 }
 
-async function getInstallationToken(env: Env): Promise<string> {
+async function getInstallationToken(env: Env, repo: string): Promise<string> {
+  const { owner } = splitRepo(repo);
+  const installations = JSON.parse(env.GH_INSTALLATIONS_JSON || '{}');
+  const installationId = installations[owner];
+  if (!installationId) {
+    throw new Error(`No GitHub App installation found for org: ${owner}`);
+  }
+  
   const appJwt = await createAppJwt(env);
-  const res = await githubFetch(env, appJwt, "POST", `/app/installations/${env.GH_INSTALLATION_ID}/access_tokens`);
+  const res = await githubFetch(env, appJwt, "POST", `/app/installations/${installationId}/access_tokens`);
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`GitHub installation token error: ${res.status} ${txt}`);
@@ -1357,7 +1367,7 @@ async function handleEvidenceGet(req: Request, env: Env, evidenceId: string): Pr
 // EVENTS HANDLER (Phase 1)
 // ============================================================================
 
-async function handlePostEvents(req: Request, env: Env, getGhToken: () => Promise<string>): Promise<Response> {
+async function handlePostEvents(req: Request, env: Env, getGhToken: (repo: string) => Promise<string>): Promise<Response> {
   const authErr = requireAuth(req, env);
   if (authErr) return authErr;
 
@@ -1388,7 +1398,7 @@ async function handlePostEvents(req: Request, env: Env, getGhToken: () => Promis
     return v2Json({ ok: true, idempotent: true, event_id: event.event_id });
   }
 
-  const ghToken = await getGhToken();
+  const ghToken = await getGhToken(event.repo);
 
   // Provenance check
   let provenanceVerified: boolean | null = null;
@@ -1551,7 +1561,7 @@ async function handleGetApprovalQueue(req: Request, env: Env): Promise<Response>
   return v2Json({ ok: true, items, count: items.length });
 }
 
-async function handleApprove(req: Request, env: Env, getGhToken: () => Promise<string>): Promise<Response> {
+async function handleApprove(req: Request, env: Env, getGhToken: (repo: string) => Promise<string>): Promise<Response> {
   const authErr = requireAuth(req, env);
   if (authErr) return authErr;
 
@@ -1569,7 +1579,6 @@ async function handleApprove(req: Request, env: Env, getGhToken: () => Promise<s
     return badRequest("action must be 'approve' or 'reject'");
   }
 
-  const ghToken = await getGhToken();
   const results: Array<{ id: string; success: boolean; error?: string }> = [];
 
   for (const id of payload.ids) {
@@ -1583,6 +1592,8 @@ async function handleApprove(req: Request, env: Env, getGhToken: () => Promise<s
         results.push({ id, success: false, error: "Not found or already processed" });
         continue;
       }
+
+      const ghToken = await getGhToken(item.repo);
 
       // Update queue status
       await env.DB.prepare(
@@ -1675,4 +1686,5 @@ export {
   conflict,
   unauthorized
 };
+
 
