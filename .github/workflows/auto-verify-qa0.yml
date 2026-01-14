@@ -1,0 +1,151 @@
+# Auto-verify QA-0 issues when CI passes
+# QA-0 = CI-only verification, no human review needed
+
+name: Auto-Verify QA-0
+
+on:
+  # Trigger on PR checks completing
+  check_suite:
+    types: [completed]
+  
+  # Also trigger on workflow completion (covers CI)
+  workflow_run:
+    workflows: ["*"]
+    types: [completed]
+
+jobs:
+  auto-verify:
+    # Only run if checks passed
+    if: >
+      (github.event.check_suite.conclusion == 'success' ||
+       github.event.workflow_run.conclusion == 'success') &&
+      github.event.check_suite.pull_requests[0] != null
+    
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Get PR info
+        id: pr-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Get PR from check suite or workflow run
+            let prNumber;
+            let headSha;
+            
+            if (context.payload.check_suite) {
+              const prs = context.payload.check_suite.pull_requests;
+              if (prs && prs.length > 0) {
+                prNumber = prs[0].number;
+                headSha = context.payload.check_suite.head_sha;
+              }
+            } else if (context.payload.workflow_run) {
+              const prs = context.payload.workflow_run.pull_requests;
+              if (prs && prs.length > 0) {
+                prNumber = prs[0].number;
+                headSha = context.payload.workflow_run.head_sha;
+              }
+            }
+            
+            if (!prNumber) {
+              console.log('No PR associated with this check');
+              return;
+            }
+            
+            // Get linked issues from PR body
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber
+            });
+            
+            // Find "Closes #XXX" or "Fixes #XXX" patterns
+            const issueMatches = pr.body?.match(/(?:closes|fixes|resolves)\s+#(\d+)/gi) || [];
+            const issueNumbers = issueMatches.map(m => parseInt(m.match(/\d+/)[0]));
+            
+            core.setOutput('pr_number', prNumber);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('issue_numbers', JSON.stringify(issueNumbers));
+            
+            console.log(`PR: #${prNumber}`);
+            console.log(`Commit: ${headSha}`);
+            console.log(`Linked issues: ${issueNumbers.join(', ') || 'none'}`);
+
+      - name: Check for QA-0 label and auto-verify
+        if: steps.pr-info.outputs.issue_numbers != '[]'
+        uses: actions/github-script@v7
+        env:
+          CRANE_RELAY_TOKEN: ${{ secrets.CRANE_RELAY_TOKEN }}
+          CRANE_RELAY_URL: https://crane-relay.automation-ab6.workers.dev
+        with:
+          script: |
+            const issueNumbers = JSON.parse('${{ steps.pr-info.outputs.issue_numbers }}');
+            const prNumber = parseInt('${{ steps.pr-info.outputs.pr_number }}');
+            const headSha = '${{ steps.pr-info.outputs.head_sha }}';
+            const repo = `${context.repo.owner}/${context.repo.repo}`;
+            
+            for (const issueNumber of issueNumbers) {
+              // Get issue labels
+              const { data: issue } = await github.rest.issues.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber
+              });
+              
+              const labels = issue.labels.map(l => l.name);
+              console.log(`Issue #${issueNumber} labels: ${labels.join(', ')}`);
+              
+              // Check for qa-grade:0
+              if (!labels.includes('qa-grade:0')) {
+                console.log(`Issue #${issueNumber} is not QA-0, skipping`);
+                continue;
+              }
+              
+              // Check for status:qa (only auto-verify if in QA state)
+              if (!labels.includes('status:qa')) {
+                console.log(`Issue #${issueNumber} is not in status:qa, skipping`);
+                continue;
+              }
+              
+              console.log(`Issue #${issueNumber} is QA-0 and in status:qa - auto-verifying`);
+              
+              // Submit PASS via Crane Relay V2
+              const eventId = `auto-qa0-${issueNumber}-${Date.now()}`;
+              
+              const response = await fetch(`${process.env.CRANE_RELAY_URL}/v2/events`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'X-Relay-Key': process.env.CRANE_RELAY_TOKEN
+                },
+                body: JSON.stringify({
+                  event_id: eventId,
+                  repo: repo,
+                  issue_number: issueNumber,
+                  role: 'QA',
+                  agent: 'github-actions-auto-qa0',
+                  event_type: 'qa.result_submitted',
+                  environment: 'ci',
+                  overall_verdict: 'PASS',
+                  summary: 'Auto-verified: CI passed, QA-0 grade (no human review required)',
+                  build: {
+                    pr: prNumber,
+                    commit_sha: headSha
+                  },
+                  scope_results: [
+                    { id: 'CI', status: 'PASS', notes: 'All CI checks passed' }
+                  ]
+                })
+              });
+              
+              const result = await response.json();
+              
+              if (result.ok) {
+                console.log(`✅ Auto-verified issue #${issueNumber}`);
+                console.log(`   Event ID: ${eventId}`);
+                console.log(`   Verdict: PASS`);
+              } else {
+                console.log(`❌ Failed to auto-verify issue #${issueNumber}`);
+                console.log(`   Error: ${JSON.stringify(result)}`);
+              }
+            }
