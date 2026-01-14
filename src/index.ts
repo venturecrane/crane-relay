@@ -64,7 +64,7 @@ interface GitHubIssueResponse {
 // V2 TYPES
 // ============================================================================
 
-type Verdict = "PASS" | "FAIL" | "BLOCKED" | "PASS_UNVERIFIED" | "FAIL_UNCONFIRMED";
+type Verdict = "PASS" | "FAIL" | "BLOCKED" | "PASS_UNVERIFIED" | "FAIL_UNCONFIRMED" | "PASS_PENDING_APPROVAL";
 type Role = "QA" | "DEV" | "PM" | "MENTOR";
 type ScopeResult = { id: string; status: "PASS" | "FAIL" | "SKIPPED"; notes?: string };
 type RelayEvent = {
@@ -163,6 +163,8 @@ function getRepo(env: Env, providedRepo?: string): string {
 const ALLOWED_ORIGINS = [
   'https://app.durganfieldguide.com',
   'https://durganfieldguide.com',
+  'https://core.durganfieldguide.com',
+  'https://crane-command.vercel.app',
   'http://localhost:3000',
 ];
 
@@ -222,6 +224,22 @@ export default {
       if (!id) return badRequest("Missing evidence id");
       try {
         return await handleEvidenceGet(request, env, id);
+      } catch (err: any) {
+        return v2Json({ error: "Internal error", details: String(err?.message || err) }, 500);
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/v2/approval-queue") {
+      try {
+        return await handleGetApprovalQueue(request, env);
+      } catch (err: any) {
+        return v2Json({ error: "Internal error", details: String(err?.message || err) }, 500);
+      }
+    }
+
+    if (request.method === "POST" && url.pathname === "/v2/approve") {
+      try {
+        return await handleApprove(request, env, getGhToken);
       } catch (err: any) {
         return v2Json({ error: "Internal error", details: String(err?.message || err) }, 500);
       }
@@ -1437,7 +1455,42 @@ async function handlePostEvents(req: Request, env: Env, getGhToken: () => Promis
 
   const commentId = await upsertRollingComment(env, ghToken, event.repo, event.issue_number, body);
 
-  // Apply label transitions
+  // Check if this needs approval queue
+  if (effectiveVerdict === "PASS_PENDING_APPROVAL") {
+    // Add to approval queue instead of transitioning labels
+    const queueId = crypto.randomUUID();
+    await env.DB.prepare(
+      `INSERT INTO approval_queue
+       (id, event_id, repo, issue_number, pr_number, commit_sha, agent, verdict, summary, scope_results, evidence_urls, created_at, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+    ).bind(
+      queueId,
+      event.event_id,
+      event.repo,
+      event.issue_number,
+      event.build?.pr ?? null,
+      event.build?.commit_sha ?? null,
+      event.agent,
+      effectiveVerdict,
+      event.summary ?? null,
+      event.scope_results ? JSON.stringify(event.scope_results) : null,
+      event.evidence_urls ? JSON.stringify(event.evidence_urls) : null,
+      nowIso()
+    ).run();
+
+    return v2Json({
+      ok: true,
+      event_id: event.event_id,
+      stored: true,
+      queued: true,
+      queue_id: queueId,
+      rolling_comment_id: commentId,
+      verdict: effectiveVerdict,
+      provenance_verified: provenanceVerified
+    }, 201);
+  }
+
+  // Apply label transitions (for non-queued verdicts)
   await applyLabelRules(env, ghToken, event.repo, event.issue_number, event.event_type, effectiveVerdict);
 
   return v2Json({
@@ -1451,6 +1504,161 @@ async function handlePostEvents(req: Request, env: Env, getGhToken: () => Promis
 }
 
 // ============================================================================
+// APPROVAL QUEUE HANDLERS
+// ============================================================================
+
+async function handleGetApprovalQueue(req: Request, env: Env): Promise<Response> {
+  const authErr = requireAuth(req, env);
+  if (authErr) return authErr;
+
+  const url = new URL(req.url);
+  const status = url.searchParams.get("status") || "pending";
+  const repo = url.searchParams.get("repo");
+  const limit = Math.min(parseInt(url.searchParams.get("limit") || "50"), 100);
+
+  let query = `SELECT * FROM approval_queue WHERE status = ?`;
+  const params: any[] = [status];
+
+  if (repo) {
+    query += ` AND repo = ?`;
+    params.push(repo);
+  }
+
+  query += ` ORDER BY created_at DESC LIMIT ?`;
+  params.push(limit);
+
+  const results = await env.DB.prepare(query).bind(...params).all();
+
+  const items = results.results.map((row: any) => ({
+    id: row.id,
+    event_id: row.event_id,
+    repo: row.repo,
+    issue_number: row.issue_number,
+    pr_number: row.pr_number,
+    commit_sha: row.commit_sha,
+    agent: row.agent,
+    verdict: row.verdict,
+    summary: row.summary,
+    scope_results: row.scope_results ? JSON.parse(row.scope_results) : null,
+    evidence_urls: row.evidence_urls ? JSON.parse(row.evidence_urls) : null,
+    created_at: row.created_at,
+    status: row.status,
+    reviewed_at: row.reviewed_at,
+    reviewed_by: row.reviewed_by,
+    review_notes: row.review_notes
+  }));
+
+  return v2Json({ ok: true, items, count: items.length });
+}
+
+async function handleApprove(req: Request, env: Env, getGhToken: () => Promise<string>): Promise<Response> {
+  const authErr = requireAuth(req, env);
+  if (authErr) return authErr;
+
+  let payload: { ids: string[]; action: "approve" | "reject"; notes?: string; reviewed_by?: string };
+  try {
+    payload = await req.json();
+  } catch {
+    return badRequest("Invalid JSON body");
+  }
+
+  if (!payload.ids || !Array.isArray(payload.ids) || payload.ids.length === 0) {
+    return badRequest("ids array required");
+  }
+  if (!payload.action || !["approve", "reject"].includes(payload.action)) {
+    return badRequest("action must be 'approve' or 'reject'");
+  }
+
+  const ghToken = await getGhToken();
+  const results: Array<{ id: string; success: boolean; error?: string }> = [];
+
+  for (const id of payload.ids) {
+    try {
+      // Get queue item
+      const item = await env.DB.prepare(
+        "SELECT * FROM approval_queue WHERE id = ? AND status = 'pending'"
+      ).bind(id).first<any>();
+
+      if (!item) {
+        results.push({ id, success: false, error: "Not found or already processed" });
+        continue;
+      }
+
+      // Update queue status
+      await env.DB.prepare(
+        `UPDATE approval_queue 
+         SET status = ?, reviewed_at = ?, reviewed_by = ?, review_notes = ?
+         WHERE id = ?`
+      ).bind(
+        payload.action === "approve" ? "approved" : "rejected",
+        nowIso(),
+        payload.reviewed_by || "captain",
+        payload.notes || null,
+        id
+      ).run();
+
+      // Apply label transitions
+      if (payload.action === "approve") {
+        // Same as PASS verdict
+        await applyLabelRules(env, ghToken, item.repo, item.issue_number, "qa.result_submitted", "PASS");
+      } else {
+        // Rejection: add needs:dev
+        const issue = await getIssueDetails(env, ghToken, item.repo, item.issue_number);
+        const currentLabels = issue.labels.map((l: any) => l.name);
+        const newLabels = currentLabels.filter((l: string) => l !== "needs:qa");
+        if (!newLabels.includes("needs:dev")) {
+          newLabels.push("needs:dev");
+        }
+        await putIssueLabels(env, ghToken, item.repo, item.issue_number, newLabels);
+      }
+
+      // Update rolling comment with approval note
+      const issue = await getIssueDetails(env, ghToken, item.repo, item.issue_number);
+      const latestDevRow = await getLatestEventByType(env, item.repo, item.issue_number, "dev.update");
+      const latestQaRow = await getLatestEventByType(env, item.repo, item.issue_number, "qa.result_submitted");
+      const latestDev = latestDevRow ? safeParseEvent(latestDevRow.payload_json) : null;
+      const latestQa = latestQaRow ? safeParseEvent(latestQaRow.payload_json) : null;
+      const recent = await getRecentEvents(env, item.repo, item.issue_number, 5);
+
+      const approvalNote = `${payload.action === "approve" ? "✅ Approved" : "❌ Rejected"} by ${payload.reviewed_by || "captain"}${payload.notes ? `: ${payload.notes}` : ""}`;
+
+      const body = renderRelayStatusMarkdown({
+        issue,
+        repo: item.repo,
+        issueNumber: item.issue_number,
+        provenance: {
+          pr: item.pr_number,
+          commit: item.commit_sha,
+          verified: null,
+          prHead: null,
+          environment: null
+        },
+        latestDev,
+        latestQa,
+        recent
+      }) + `\n\n### Approval\n${approvalNote}`;
+
+      await upsertRollingComment(env, ghToken, item.repo, item.issue_number, body);
+
+      results.push({ id, success: true });
+    } catch (err: any) {
+      results.push({ id, success: false, error: String(err?.message || err) });
+    }
+  }
+
+  const approved = results.filter(r => r.success).length;
+  const failed = results.filter(r => !r.success).length;
+
+  return v2Json({
+    ok: failed === 0,
+    processed: results.length,
+    approved,
+    failed,
+    results
+  });
+}
+
+// ============================================================================
 // EXPORTS (for integration)
 // ============================================================================
 
@@ -1458,6 +1666,8 @@ export {
   handlePostEvents,
   handleEvidenceUpload,
   handleEvidenceGet,
+  handleGetApprovalQueue,
+  handleApprove,
   getInstallationToken,
   requireAuth,
   v2Json,
@@ -1465,3 +1675,4 @@ export {
   conflict,
   unauthorized
 };
+
