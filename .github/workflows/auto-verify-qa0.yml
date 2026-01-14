@@ -125,7 +125,7 @@ jobs:
                   role: 'QA',
                   agent: 'github-actions-auto-qa0',
                   event_type: 'qa.result_submitted',
-                  environment: 'ci',
+                  environment: 'dev',
                   overall_verdict: 'PASS',
                   summary: 'Auto-verified: CI passed, QA-0 grade (no human review required)',
                   build: {
@@ -149,3 +149,4 @@ jobs:
                 console.log(`   Error: ${JSON.stringify(result)}`);
               }
             }
+
